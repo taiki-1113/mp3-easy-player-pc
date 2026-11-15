@@ -59,7 +59,7 @@ h1 { margin: 0 0 .4rem; font-size: 1.6rem; line-height: 1.4; }
 h2 { margin: 1.4rem 0 .5rem; font-size: 1.13rem; line-height: 1.5; }
 p { margin: .5rem 0 1rem; overflow-wrap: anywhere; }
 button, select { font: inherit; color: inherit; min-height: 52px; border-radius: .4rem; }
-button { cursor: pointer; background: var(--control); border: 2px solid var(--border); padding: .7rem .9rem; text-align: center; touch-action: manipulation; }
+button { display: block; width: 100%; cursor: pointer; background: var(--control); border: 2px solid var(--border); padding: .7rem .9rem; text-align: center; touch-action: manipulation; }
 button:hover { background: var(--hover); }
 button:focus-visible, select:focus-visible, summary:focus-visible, [tabindex]:focus-visible { outline: 4px solid var(--focus); outline-offset: 4px; }
 button[aria-pressed="true"] { border-width: 4px; font-weight: 700; background: var(--selected); }
@@ -70,13 +70,12 @@ button.danger:hover { background: var(--danger-hover); }
 button[aria-disabled="true"], button[aria-disabled="true"]:hover { background: var(--disabled-bg); color: var(--disabled-text); border-color: var(--line); border-style: dashed; cursor: default; }
 .home-actions, .stack { display: grid; gap: .8rem; margin: 1.2rem 0; }
 .home-actions button { min-height: 76px; font-size: 1.16rem; }
-.view-options { display: grid; grid-template-columns: 1fr 1fr; gap: .6rem; margin-top: 1rem; }
+.view-options { display: grid; grid-template-columns: 1fr; gap: .6rem; margin-top: 1rem; }
 .view-options button { min-width: 0; padding-inline: .4rem; }
 .subtle { font-size: .9rem; color: var(--muted); }
 .playback { padding: 1rem; border: 1px solid var(--line); border-radius: .5rem; margin: 1rem 0 1.4rem; background: var(--player); }
 .playback h2 { margin: 0; }
-.transport { display: grid; gap: .6rem; grid-template-columns: 1fr 1fr; }
-.transport .primary { grid-column: 1 / -1; }
+.transport { display: grid; gap: .6rem; grid-template-columns: 1fr; }
 .playing-name { font-size: 1.13rem; font-weight: 700; margin-bottom: .25rem; }
 .playback .state { font-size: .9rem; margin-bottom: .8rem; }
 label { display: block; font-weight: 700; margin: .8rem 0 .3rem; }

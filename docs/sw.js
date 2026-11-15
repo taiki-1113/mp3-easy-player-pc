@@ -1,4 +1,4 @@
-const CACHE = 'mp3-easy-player-pc-v1';
+const CACHE = 'mp3-easy-player-pc-v2';
 const BASE = new URL('./', self.location.href);
 const ASSETS = ['./', './index.html', './app.js', './model.js', './library.js', './storage.js', './style.css', './manifest.webmanifest', './icon.svg', './icon-192.png', './icon-512.png'].map(path => new URL(path, BASE).href);
 self.addEventListener('install', event => event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(ASSETS))));
