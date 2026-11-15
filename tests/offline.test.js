@@ -5,12 +5,12 @@ import vm from 'node:vm';
 function worker(fail = false) {
   const handlers = {}, stored = new Map(), deleted = [];
   const cache = {
-    async addAll(urls) { if (fail) throw Error('offline'); for (const url of urls) stored.set(url, new Response(url)); },
+    async addAll(requests) { if (fail) throw Error('offline'); for (const request of requests) { assert.equal(request.cache, 'reload'); stored.set(request.url, new Response(request.url)); } },
     async match(request) { return stored.get(request.url)?.clone(); },
   };
-  const context = { URL, fetch: async () => { throw Error('offline'); }, caches: {
+  const context = { URL, Request, fetch: async () => { throw Error('offline'); }, caches: {
     open: async () => cache, keys: async () => ['mp3-easy-player-pc-old', 'mp3-easy-player-iphone'], delete: async name => deleted.push(name),
-  }, self: { location: { href: 'https://example.test/mp3-easy-player-pc/sw.js' }, addEventListener: (name, handler) => handlers[name] = handler, clients: { claim: async () => {} } } };
+  }, self: { location: { href: 'https://example.test/mp3-easy-player-pc/sw.js' }, addEventListener: (name, handler) => handlers[name] = handler, skipWaiting: async () => {}, clients: { claim: async () => {} } } };
   vm.runInNewContext(readFileSync(new URL('../docs/sw.js', import.meta.url), 'utf8'), context);
   return { stored, deleted, async lifecycle(name) { let result; handlers[name]({ waitUntil: p => result = p }); await result; }, async request(url) { let result; handlers.fetch({ request: { url, method: 'GET' }, respondWith: p => result = p }); return result; } };
 }
