@@ -122,11 +122,12 @@ test('再生方法の切替で現在曲と一時停止状態を保持し、順�
   assert.equal(restored.index, ordered.index);
   assert.equal(restored.playing, false);
 });
-test('全曲のシャッフル設定をフォルダ再生には適用しない', () => {
+test('フォルダ内でもシャッフルを選択でき、他フォルダへ出ない', () => {
   const selected = selectTrack(initialLibrary(), 'あさの音楽', 'morning', 'shuffle', () => 0);
-  assert.equal(selected.order, 'ordered');
-  assert.deepEqual(selected.queue.map(item => item.id), ['morning', 'walk']);
-  assert.equal(setPlaybackOrder(selected, 'shuffle'), selected);
+  assert.equal(selected.order, 'shuffle');
+  assert.deepEqual(selected.queue.map(item => item.id).sort(), ['morning', 'walk']);
+  assert.equal(selected.queue.every(item => item.folder === 'あさの音楽'), true);
+  assert.deepEqual(setPlaybackOrder(selected, 'ordered').queue.map(item => item.id), ['morning', 'walk']);
 });
 test('シャッフル中の削除でも残った再生順を守り、取り込み曲を無断追加しない', () => {
   const library = initialLibrary();

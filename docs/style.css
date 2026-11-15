@@ -49,7 +49,7 @@
   }
 }
 * { box-sizing: border-box; }
-body { margin: 0 auto; max-width: 38rem; padding: 1.2rem 1rem 2rem; }
+body { margin: 0 auto; max-width: 54rem; padding: 1.2rem 1rem 2rem; }
 .brand p { margin: 0 0 .8rem; font-weight: 700; font-size: .94rem; }
 .badge { margin-inline-start: .4rem; padding: .2rem .45rem; border: 1px solid var(--line); border-radius: .3rem; font-weight: 500; white-space: nowrap; }
 .mock-note, footer { font-size: .85rem; color: var(--muted); }
@@ -61,7 +61,8 @@ p { margin: .5rem 0 1rem; overflow-wrap: anywhere; }
 button, select { font: inherit; color: inherit; min-height: 52px; border-radius: .4rem; }
 button { cursor: pointer; background: var(--control); border: 2px solid var(--border); padding: .7rem .9rem; text-align: center; touch-action: manipulation; }
 button:hover { background: var(--hover); }
-button:focus-visible, select:focus-visible, summary:focus-visible, [tabindex="-1"]:focus-visible { outline: 4px solid var(--focus); outline-offset: 4px; }
+button:focus-visible, select:focus-visible, summary:focus-visible, [tabindex]:focus-visible { outline: 4px solid var(--focus); outline-offset: 4px; }
+button[aria-pressed="true"] { border-width: 4px; font-weight: 700; background: var(--selected); }
 button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 700; }
 button.primary:hover { background: var(--accent-hover); }
 button.danger { color: var(--danger); border-color: var(--danger); }

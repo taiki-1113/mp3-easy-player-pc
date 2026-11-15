@@ -27,8 +27,7 @@ function shuffle(items, random) {
   return result;
 }
 export function setPlaybackOrder(player, order, random = Math.random) {
-  // Folder playback is always ordered. Changing the browsing view never changes its queue.
-  if (player.context !== null || !player.queue.length) return player;
+  if (!player.queue.length) return { ...player, order };
   const currentId = player.queue[player.index].id;
   const ordered = player.queue.slice().sort((a, b) => compare(a.folder, b.folder) || compare(a.name, b.name) || compare(a.id, b.id));
   const queue = order === 'shuffle'
@@ -40,7 +39,7 @@ export function selectTrack(library, folder, id, order = 'ordered', random = Mat
   const queue = entries(library, folder);
   const index = queue.findIndex(item => item.id === id);
   if (index < 0) return createPlayer();
-  return setPlaybackOrder({ queue, index, context: folder, playing: true, order: 'ordered' }, folder === null ? order : 'ordered', random);
+  return setPlaybackOrder({ queue, index, context: folder, playing: true, order: 'ordered' }, order, random);
 }
 export function selectAllTracks(library, order = 'ordered', random = Math.random) {
   const items = entries(library);

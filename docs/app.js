@@ -1,319 +1,295 @@
-import { entries, sortedFolders, createPlayer, selectTrack, selectAllTracks, setPlaybackOrder, step, reconcilePlayer } from './model.js?v=20261101-6';
-import { readLibrary, readTrack, storeTrack, deleteFromLibrary } from './storage.js?v=20261101-6';
-import { hashBlob } from './sha256.js?v=20261101-6';
-import { validateMp3, sourceInfo } from './mp3.js?v=20261101-6';
+import { entries, sortedFolders, createPlayer, selectTrack, setPlaybackOrder, step } from './model.js';
+import { scanDirectory, ensureReadPermission } from './library.js';
+import { loadDirectory, saveDirectory } from './storage.js';
 
-const VERSION='20261101-6', base=new URL('./',location.href);
-const app=document.querySelector('#app'), status=document.querySelector('#announcement');
-const dialog=document.querySelector('#confirm-dialog'), audio=document.querySelector('#audio');
-const folderInput=document.querySelector('#folder-input'), filesInput=document.querySelector('#files-input');
-let library={folders:[],members:[]}, player=createPlayer();
-let screen='home', view='all', allOrder='ordered', folder=null, managing=false;
-let importState='ready', importing=false, abortImport=null, result=null, fatal='';
-let pendingDelete=null, restoreFocusId=null, announcementTimer, deleting=false;
-let sourceToken=0, objectUrl=null, allowedToPlay=false, preparing=false, playbackError='';
-let failedTracks=new Set(), handledError=-1, wakeLock=null, lastTimeUpdate=0;
-const changes='BroadcastChannel' in window?new BroadcastChannel('mp3-library-changes'):null;
-const esc=value=>String(value).replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[char]);
-const button=(id,text,cls='',attrs='')=>`<button type="button" id="${id}" class="${cls}" ${attrs}>${text}</button>`;
-const heading=text=>`<h1 id="screen-title" tabindex="-1">${text}</h1>`;
-const back=button('home','ホームへ戻る','back');
-const current=()=>player.queue[player.index];
-const canStartAll=()=>view==='all'&&library.members.length>0;
-const modeFolder=()=>view==='all'?null:folder;
-const canStartSelection=()=>view==='all'?canStartAll():folder!==null&&entries(library,folder).length>0;
-const orderLabel=order=>order==='shuffle'?'シャッフル再生':'順番に再生';
-const queueDescription=()=>`${player.context??'すべての曲'}。${player.context===null?orderLabel(player.order)+'。':''}${player.queue.length}曲を繰り返します。`;
-const focus=id=>document.getElementById(id)?.focus();
-const time=seconds=>Number.isFinite(seconds)?`${Math.floor(seconds/60)}分${Math.floor(seconds%60)}秒`:'時間不明';
-function announce(message) {
-  clearTimeout(announcementTimer);status.textContent='';
-  announcementTimer=setTimeout(()=>{status.textContent=message;},90);
+const app = document.querySelector('#app'), audio = document.querySelector('#audio');
+let library = { folders: [], members: [] }, player = createPlayer(), root = null;
+let screen = 'player', view = 'all', folder = null, order = 'ordered';
+let busy = false, needsPermission = false, ready = false, note = '', error = '';
+let token = 0, objectUrl = null, loadedId = null, preparing = false, wantsPlay = false;
+let announceTimer, failed = new Set();
+const supported = isSecureContext && 'showDirectoryPicker' in window;
+const current = () => player.queue[player.index];
+const scope = () => view === 'all' ? null : folder;
+const items = () => view === 'folders' && folder === null ? [] : entries(library, scope());
+const folderLabel = name => name === '' ? `${root?.name ?? '音楽フォルダ'}（親フォルダ直下）` : name;
+const orderLabel = () => order === 'shuffle' ? 'シャッフル再生' : '順番再生';
+const esc = value => String(value).replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' })[c]);
+const button = (id, label, attrs = '') => `<button type="button" id="${id}" ${attrs}>${esc(label)}</button>`;
+const unavailable = value => value ? 'aria-disabled="true"' : '';
+function announce(message, urgent = false) {
+  clearTimeout(announceTimer);
+  document.querySelector('#announcement').textContent = '';
+  document.querySelector('#error-announcement').textContent = '';
+  announceTimer = setTimeout(() => { document.querySelector(urgent ? '#error-announcement' : '#announcement').textContent = message; }, 60);
 }
-function readableError(error) {
-  if(error?.name==='QuotaExceededError')return '空き容量が足りません。端末の空き容量を確保して再試行してください。';
-  if(['NotReadableError','NotFoundError','SecurityError'].includes(error?.name))return 'ファイルを読み取れません。カードの接続とフォルダを確認してください。';
-  if(error?.name==='AbortError')return '処理を中断しました。保存済みの曲は残っています。';
-  return error?.message&&!/database|indexeddb|transaction|object.?store|request/i.test(error.message)?error.message:'端末内の保存先を利用できません。画面を読み込み直して再試行してください。';
+function focus(id) { document.getElementById(id)?.focus(); }
+function stateText() {
+  return preparing ? '曲を読み込んでいます' : current() ? player.playing ? '再生中' : '一時停止中' : '停止中';
 }
-function playbackState() {
-  return playbackError || (preparing?'曲を読み込んでいます。':current()?(player.playing?'再生中':'一時停止中'):canStartAll()?'再生ボタンで、すべての曲を再生します。':view==='folders'?(folder?'再生ボタンで、このフォルダを再生します。':'フォルダを選んでください。'):'一覧から曲を選んでください。');
+function summary() {
+  return current() ? `${stateText()}。「${current().name}」。フォルダ「${folderLabel(current().folder)}」。${orderLabel()}。` : `${stateText()}。${view === 'all' ? 'すべての曲' : folder === null ? 'フォルダ未選択' : folderLabel(folder)}。${orderLabel()}。`;
 }
-function playback() {
-  const item=current(), unavailable=item?'':'aria-disabled="true"';
-  return `<section class="playback" aria-label="再生操作"><div class="transport">
-  ${button('play',player.playing?'一時停止':'再生','primary',item||canStartSelection()?'':'aria-disabled="true"')}
-  ${button('next','次の曲','',unavailable)}${button('previous','前の曲','',unavailable)}</div>
-  <div id="playback-summary" role="group" tabindex="0" aria-label="${esc(playbackSummary())}">
-  <p class="playing-name" id="current-name" aria-hidden="true">${item?esc(item.name):canStartAll()?'すべての曲':'曲を選んでください'}</p>
-  <p class="state" id="playback-state" aria-hidden="true">${esc(playbackState())}</p></div>
-  <details><summary>再生の詳細</summary>
-  <p class="subtle" id="playback-time">${item?`${time(audio.currentTime)}／${time(audio.duration)}`:''}</p>
-  <p class="subtle" id="queue-info" ${item?'':'hidden'}>${item?esc(queueDescription()):''}</p></details></section>`;
-}
-function playbackSummary(){return current()?`${current().name}。${playbackState()}`:playbackState();}
-function trackLabel(item,deletion=false){return `${item.name}${view==='all'?'、'+item.folder:''}${deletion?'、削除':current()?.id===item.id?'、'+(player.playing?'再生中':'選択中'):''}`;}
-function rowDetail(item,deletion=false) {
-  return esc((deletion?'削除の確認へ':current()?.id===item.id?(player.playing?'再生中':'選択中'):'選んで再生')+(view==='all'?' ・ '+item.folder:''));
-}
-function rows(items,deletion=false) {
-  if(!items.length)return '<p>曲がありません。取り込み画面から追加できます。</p>';
-  return `<ul aria-label="${deletion?'削除する曲':'曲の一覧'}">${items.map(item=>`<li><button type="button" class="row" id="track-${item.id}" data-${deletion?'delete':'track'}="${item.id}" ${!deletion&&current()?.id===item.id?'aria-current="true"':''} aria-label="${esc(trackLabel(item,deletion))}"><span class="title" aria-hidden="true">${esc(item.name)}</span><span class="detail" aria-hidden="true">${rowDetail(item,deletion)}</span></button></li>`).join('')}</ul>`;
-}
-function render(focusId=null) {
-  clearTimeout(announcementTimer);status.textContent='';
-  if(fatal)app.innerHTML=`${heading('保存先を開けません')}<p>${esc(fatal)}</p>${button('retry','もう一度試す','primary')}`;
-  else if(screen==='home')app.innerHTML=`${heading('音楽を楽しむ')}<div class="home-actions">${button('listen','音楽を聴く','primary')}${button('import','音楽を取り込む')}</div><p class="subtle" id="library-count">${entries(library).length}曲・${library.folders.length}フォルダ</p>`;
-  else if(screen==='folder-picker')app.innerHTML=`${heading('フォルダを選ぶ')}${button('cancel-folder','戻る')}${library.folders.length?`<ul aria-label="フォルダ一覧">${sortedFolders(library).map((name,index)=>`<li><button type="button" class="row" id="folder-${index}" data-folder="${esc(name)}"><span class="title">${esc(name.replaceAll('/',' ／ '))}</span><span class="detail">${entries(library,name).length}曲</span></button></li>`).join('')}</ul>`:'<p>フォルダがありません。</p>'}`;
-  else if(screen==='library') {
-    const atFolders=view==='folders'&&folder===null;
-    if(managing)app.innerHTML=`${heading('曲の削除')}<p class="subtle">${view==='all'?'すべてのフォルダから削除します。':esc(folder)+'から削除します。別フォルダの曲は残ります。'}</p>${button('manage-done','曲一覧へ戻る')}${rows(entries(library,modeFolder()),true)}${folder&&view==='folders'?button('delete-folder','このフォルダをまとめて削除','danger'):''}${back}`;
-    else {
-      const items=atFolders?[]:entries(library,modeFolder());
-      app.innerHTML=`${heading('音楽を聴く')}<div class="view-options" role="group" aria-label="曲の表示方法">
-      ${button('view-all','すべての曲',view==='all'?'primary':'',`data-view="all" aria-pressed="${view==='all'}"`)}
-      ${button('view-folders','フォルダ別',view==='folders'?'primary':'',`data-view="folders" aria-pressed="${view==='folders'}"`)}</div>
-      ${view==='all'?`<label for="play-order" aria-hidden="true">すべての曲の再生方法</label><select id="play-order" aria-label="すべての曲の再生方法"><option value="ordered" ${allOrder==='ordered'?'selected':''}>順番に再生</option><option value="shuffle" ${allOrder==='shuffle'?'selected':''}>シャッフル再生</option></select>`:''}
-      ${view==='folders'?button('choose-library-folder',folder?'フォルダを変更：'+esc(folder.replaceAll('/',' ／ ')):'フォルダを選ぶ','back'):''}
-      ${playback()}
-      ${!atFolders?`<h2 id="list-title" tabindex="-1">${esc(view==='all'?'すべての曲':folder)}</h2>${rows(items)}`:''}
-      <div class="section-actions">${!atFolders&&(items.length||folder)?button('manage','曲を削除する'):''}${!library.members.length?button('import','音楽を取り込む','primary'):''}</div>${back}`;
-    }
-  } else if(screen==='import') {
-    if(importState==='ready')app.innerHTML=`${heading('音楽を取り込む')}<p>毎回同じフォルダを選び、保存中は画面とカード接続を維持してください。</p><div class="stack">${button('choose-folder','取り込み元のフォルダを選ぶ','primary')}</div><details><summary>フォルダを選択できないとき</summary>${button('choose-files','MP3をまとめて選ぶ')}</details>${back}`;
-    else if(importState==='running')app.innerHTML=`${heading('取り込み中')}<p id="import-progress" tabindex="-1">取り込みを開始します。</p><p>この画面を開いたままお待ちください。</p>${button('cancel-import','取り込みを中止')}`;
-    else {
-      const r=result, summary=`${r.stopped?'取り込みを中断しました。':''}新しく${r.newTracks}曲を保存しました。${r.duplicates}件は取り込み済み、失敗${r.failures.length}件、未処理${r.total-r.processed}件です。${r.skipped?'隠しファイルなど'+r.skipped+'件は対象外です。':''}`;
-      app.innerHTML=`${heading('取り込み結果')}<div class="result"><p id="import-result" tabindex="-1">${esc(summary)}</p>${r.memberships?`<p>既存の曲を別のフォルダに${r.memberships}件追加しました。</p>`:''}${r.reason?`<p>${esc(r.reason)}</p>`:''}${r.total===0?'<p>MP3がありません。取り込み元フォルダを確認してください。</p>':''}</div><div class="stack">${button('listen','音楽を聴く','primary')}${button('again','もう一度取り込む')}</div>${r.failures.length?`<details><summary>保存できなかった曲を確認</summary><ul>${r.failures.map(item=>`<li><p>${esc(item.name)}。${esc(item.reason)}</p></li>`).join('')}</ul></details>`:''}${back}`;
-    }
+function render(focusId) {
+  app.setAttribute('aria-busy', String(busy));
+  const heading = text => `<h1 id="screen-title" tabindex="-1">${text}</h1>`;
+  if (screen === 'folders') {
+    app.innerHTML = `${heading('フォルダを選ぶ')}<p>選択後は再生ボタンで開始します。</p>${button('back', 'プレーヤーへ戻る')}
+      <ul aria-label="フォルダ一覧">${sortedFolders(library).map((name, i) => `<li>${button(`folder-${i}`, `${folderLabel(name)}、${entries(library, name).length}曲`, `class="row" data-folder="${esc(name)}" ${folder === name ? 'aria-current="true"' : ''}`)}</li>`).join('')}</ul>`;
+    document.title = 'フォルダを選ぶ｜MP3かんたんプレイヤー PC';
+  } else {
+    app.innerHTML = `${heading('音楽プレーヤー')}
+      <p class="subtle">${root ? `音楽フォルダ：${esc(root.name)}` : '最初に音楽の親フォルダを登録してください。'}</p>
+      ${!supported ? '<p class="result">この環境では音楽フォルダを直接参照できません。WindowsのEdgeまたはChromeでHTTPSの公開ページを開いてください。</p>' : ''}
+      <p id="library-note" ${note ? '' : 'hidden'}>${esc(note)}</p><p id="visible-error" class="result" ${error ? '' : 'hidden'}>${esc(error)}</p>
+      <div class="view-options" role="group" aria-label="再生対象">
+        ${button('view-all', 'すべての曲', `aria-pressed="${view === 'all'}" ${unavailable(busy)}`)}
+        ${button('view-folders', 'フォルダ別', `aria-pressed="${view === 'folders'}" ${unavailable(busy)}`)}
+      </div>
+      ${view === 'folders' ? button('choose-folder', folder === null ? 'フォルダを選ぶ' : `フォルダを変更：${folderLabel(folder)}`, unavailable(busy || !ready)) : ''}
+      <label for="play-order">再生方法</label><select id="play-order" ${busy ? 'disabled' : ''}>
+        <option value="ordered" ${order === 'ordered' ? 'selected' : ''}>順番再生</option>
+        <option value="shuffle" ${order === 'shuffle' ? 'selected' : ''}>シャッフル再生</option>
+      </select>
+      <section class="playback" aria-label="再生操作">
+        <div class="transport">${button('play', player.playing || preparing ? '一時停止' : '再生', `class="primary" ${unavailable(busy || !ready || !items().length)}`)}
+          ${button('previous', '前の曲', unavailable(busy || !current()))}${button('next', '次の曲', unavailable(busy || !current()))}</div>
+        <div id="playback-summary" tabindex="0" role="group" aria-label="${esc(summary())}">
+          <p id="current-name" class="playing-name" aria-hidden="true">${esc(current()?.name ?? '曲を選んでください')}</p>
+          <p id="playback-state" aria-hidden="true">${esc(stateText())}</p>
+        </div>
+        <details><summary>再生の詳細</summary><p id="playback-time"></p><p id="queue-info"></p></details>
+      </section>
+      <h2 id="list-title" tabindex="-1">${esc(view === 'all' ? 'すべての曲' : folder === null ? 'フォルダ未選択' : folderLabel(folder))}（${items().length}曲）</h2>
+      ${items().length ? `<ul aria-label="曲一覧">${items().map((item, i) => `<li>${button(`track-${i}`, `${item.name}、${folderLabel(item.folder)}`, `class="row" data-track="${esc(item.id)}"`)}</li>`).join('')}</ul>` : '<p>曲がありません。音楽フォルダの登録、アクセス許可、選択したフォルダを確認してください。</p>'}
+      <div class="section-actions" aria-label="音楽フォルダの設定">
+        ${needsPermission ? button('grant', 'アクセスを再許可', unavailable(busy)) : ''}
+        ${button('register', root ? '音楽フォルダを再設定' : '音楽フォルダを登録', unavailable(busy || !supported))}
+        ${button('refresh', '曲一覧を再読み込み', unavailable(busy || !root))}
+      </div>`;
+    document.title = '音楽プレーヤー｜MP3かんたんプレイヤー PC';
+    updatePlayback();
   }
-  document.title=`${app.querySelector('h1')?.textContent??'音楽'}｜MP3かんたんプレイヤー`;
-  if(focusId)focus(document.getElementById(focusId)?focusId:document.getElementById('choose-library-folder')?'choose-library-folder':'screen-title');
+  if (focusId) focus(document.getElementById(focusId) ? focusId : 'screen-title');
 }
-function updatePlayback(message=null) {
-  const item=current(), play=document.getElementById('play');
-  if(play) {
-    play.textContent=player.playing?'一時停止':'再生';
-    for(const id of ['play','next','previous']){const e=document.getElementById(id);if(item||(id==='play'&&canStartSelection()))e.removeAttribute('aria-disabled');else e.setAttribute('aria-disabled','true');}
-    document.getElementById('current-name').textContent=item?.name??(canStartAll()?'すべての曲':'曲を選んでください');
-    document.getElementById('playback-state').textContent=playbackState();
-    document.getElementById('playback-summary').setAttribute('aria-label',playbackSummary());
-    const info=document.getElementById('queue-info');info.hidden=!item;info.textContent=item?queueDescription():'';
+function updatePlayback(message) {
+  const play = document.getElementById('play');
+  if (play) {
+    play.textContent = player.playing || preparing ? '一時停止' : '再生';
+    document.getElementById('current-name').textContent = current()?.name ?? '曲を選んでください';
+    document.getElementById('playback-state').textContent = stateText();
+    document.getElementById('playback-summary').setAttribute('aria-label', summary());
+    for (const id of ['previous', 'next']) document.getElementById(id).setAttribute('aria-disabled', String(busy || !current()));
+    document.getElementById('queue-info').textContent = current() ? `${player.context === null ? 'すべての曲' : folderLabel(player.context)}。${orderLabel()}。${player.queue.length}曲を繰り返します。` : '';
+    for (const row of app.querySelectorAll('[data-track]')) {
+      const selected = row.dataset.track === current()?.id;
+      if (selected) row.setAttribute('aria-current', 'true'); else row.removeAttribute('aria-current');
+      const item = library.members.find(item => item.id === row.dataset.track);
+      row.setAttribute('aria-label', `${item.name}、${folderLabel(item.folder)}${selected ? '、' + stateText() : '、選んで再生'}`);
+    }
     updateTime();
-    app.querySelectorAll('[data-track]').forEach(row=>{
-      const entry=entries(library,modeFolder()).find(value=>value.id===row.dataset.track);if(!entry)return;
-      if(item?.id===entry.id)row.setAttribute('aria-current','true');else row.removeAttribute('aria-current');
-      row.setAttribute('aria-label',trackLabel(entry));
-      row.querySelector('.detail').innerHTML=rowDetail(entry);
-    });
   }
-  if(message)announce(message);
+  updateSystemMedia();
+  if (message) announce(message);
 }
 function updateTime() {
-  const element=document.getElementById('playback-time');
-  if(element)element.textContent=current()?`${time(audio.currentTime)}／${time(audio.duration)}`:'';
-  if('mediaSession' in navigator&&Number.isFinite(audio.duration)&&audio.duration>0)try{navigator.mediaSession.setPositionState({duration:audio.duration,playbackRate:audio.playbackRate,position:Math.min(audio.currentTime,audio.duration)});}catch{}
+  const time = value => Number.isFinite(value) ? `${Math.floor(value / 60)}分${Math.floor(value % 60)}秒` : '時間不明';
+  const output = document.getElementById('playback-time');
+  if (output) output.textContent = current() ? `${time(audio.currentTime)}／${time(audio.duration)}` : '';
+  if (navigator.mediaSession && Number.isFinite(audio.duration) && audio.duration > 0) try {
+    navigator.mediaSession.setPositionState({ duration: audio.duration, playbackRate: audio.playbackRate, position: Math.min(audio.currentTime, audio.duration) });
+  } catch {}
 }
 function updateSystemMedia() {
-  if(!('mediaSession' in navigator))return;
-  const item=current();
-  if(!item){navigator.mediaSession.metadata=null;navigator.mediaSession.playbackState='none';return;}
-  if('MediaMetadata' in window)navigator.mediaSession.metadata=new MediaMetadata({title:item.name,artist:item.folder,album:'端末に保存した音楽'});
-  navigator.mediaSession.playbackState=player.playing?'playing':'paused';updateTime();
+  if (!navigator.mediaSession) return;
+  const item = current();
+  navigator.mediaSession.metadata = item && 'MediaMetadata' in window ? new MediaMetadata({ title: item.name, artist: folderLabel(item.folder), album: 'PCの音楽フォルダ' }) : null;
+  navigator.mediaSession.playbackState = item ? player.playing ? 'playing' : 'paused' : 'none';
 }
-function stopPlayback(message='') {
-  ++sourceToken;allowedToPlay=false;audio.pause();audio.removeAttribute('src');audio.load();
-  if(objectUrl){URL.revokeObjectURL(objectUrl);objectUrl=null;}
-  player=createPlayer();preparing=false;playbackError=message;updateSystemMedia();updatePlayback(message);
+function clearSource() {
+  ++token; wantsPlay = false; preparing = false; audio.pause();
+  audio.removeAttribute('src'); audio.load(); loadedId = null;
+  if (objectUrl) URL.revokeObjectURL(objectUrl);
+  objectUrl = null;
 }
-async function startCurrent(userAction=false) {
-  const item=current();if(!item)return;
-  const token=++sourceToken;handledError=-1;preparing=true;playbackError='';player.playing=false;allowedToPlay=true;
-  if(userAction)failedTracks.clear();updatePlayback();updateSystemMedia();
+function stop() { clearSource(); player = createPlayer(); updateSystemMedia(); }
+function showError(message) {
+  error = message;
+  const output = document.getElementById('visible-error');
+  if (output) { output.hidden = false; output.textContent = message; }
+  announce(message, true);
+}
+async function startCurrent(userAction = false) {
+  const item = current(); if (!item || busy || !ready) return;
+  clearSource(); const sourceToken = token; wantsPlay = true; preparing = true; player.playing = false;
+  if (userAction) failed.clear();
+  error = ''; document.getElementById('visible-error')?.setAttribute('hidden', ''); updatePlayback();
   try {
-    let url;
-    if(navigator.serviceWorker?.controller)url=new URL('_audio/'+item.id,base).href;
-    else {const record=await readTrack(item.id);if(token!==sourceToken)return;if(!record?.blob)throw new Error('保存した曲が見つかりません。元のフォルダから取り込み直してください。');url=URL.createObjectURL(record.blob);}
-    const old=objectUrl;objectUrl=url.startsWith('blob:')?url:null;audio.src=url;
-    const started=audio.play();if(old)URL.revokeObjectURL(old);await started;
-  } catch(error) {
-    if(token!==sourceToken||error.name==='AbortError')return;
-    if(error.name==='NotAllowedError'){allowedToPlay=false;preparing=false;player.playing=false;playbackError='自動再生が停止しました。「再生」を押してください。';updatePlayback(playbackError);updateSystemMedia();return;}
-    handleAudioFailure();
+    const file = await item.handle.getFile();
+    if (sourceToken !== token) return;
+    objectUrl = URL.createObjectURL(file); loadedId = item.id; audio.src = objectUrl;
+    await audio.play();
+  } catch (failure) {
+    if (sourceToken !== token) return;
+    preparing = false; wantsPlay = false; player.playing = false;
+    if (failure.name === 'NotAllowedError' || failure.name === 'SecurityError') {
+      const permission = await ensureReadPermission(root).catch(() => false);
+      if (sourceToken !== token) return;
+      if (!permission) {
+        stop(); ready = false; needsPermission = true;
+        error = '音楽フォルダへのアクセスが必要です。「アクセスを再許可」を押してください。';
+        render('grant'); announce(error, true);
+      } else { updatePlayback(); showError('再生を開始できませんでした。「再生」を押してください。'); }
+      return;
+    }
+    handleFailure(sourceToken);
   }
 }
-function handleAudioFailure() {
-  if(handledError===sourceToken||!current())return;
-  handledError=sourceToken;const name=current().name;failedTracks.add(current().id);
-  if(player.queue.every(item=>failedTracks.has(item.id))){stopPlayback('再生できる曲がないため停止しました。元のファイルを確認し、取り込み直してください。');return;}
-  do{player=step(player,1);}while(failedTracks.has(current().id));
-  void startCurrent();announce(`「${name}」を再生できません。次の曲「${current().name}」へ進みます。`);
-}
-function moveTrack(delta) {
-  if(!current())return;player=step(player,delta);void startCurrent(true);announce(`「${current().name}」を再生します。`);
+function handleFailure(sourceToken = token) {
+  if (sourceToken !== token || !current() || failed.has(current().id)) return;
+  const name = current().name; failed.add(current().id);
+  if (player.queue.every(item => failed.has(item.id))) {
+    stop(); updatePlayback(); showError('再生できる曲がありません。元ファイルとドライブの接続を確認し、曲一覧を再読み込みしてください。'); return;
+  }
+  do { player = step(player, 1); } while (failed.has(current().id));
+  void startCurrent(); showError(`「${name}」を再生できません。次の曲「${current().name}」へ進みます。元ファイルを確認してください。`);
 }
 function togglePlayback() {
-  if(!player.playing&&!preparing&&canStartAll()&&(!current()||player.context!==null)){
-    player=selectAllTracks(library,allOrder);void startCurrent(true);announce(`すべての曲を${orderLabel(allOrder)}します。`);return;
+  if (busy || !ready || !items().length) return;
+  if (player.playing || preparing) {
+    ++token; wantsPlay = false; preparing = false; audio.pause(); player.playing = false; updatePlayback('一時停止しました。'); return;
   }
-  if(!player.playing&&!preparing&&view==='folders'){
-    if(!canStartSelection()){announce('フォルダを選んでください。');return;}
-    if(!current()||player.context!==folder){
-      player=selectTrack(library,folder,entries(library,folder)[0].id);void startCurrent(true);announce(`「${folder}」を再生します。`);return;
-    }
+  if (!current()) {
+    const list = items();
+    const first = list[order === 'shuffle' ? Math.floor(Math.random() * list.length) : 0];
+    player = selectTrack(library, scope(), first.id, order); void startCurrent(true); return;
   }
-  if(!current()){announce('一覧から曲を選んでください。');return;}
-  if(player.playing||preparing){allowedToPlay=false;++sourceToken;audio.pause();preparing=false;player.playing=false;updatePlayback('一時停止しました。');updateSystemMedia();}
-  else {
-    playbackError='';allowedToPlay=true;preparing=true;updatePlayback();
-    if(!audio.getAttribute('src')){void startCurrent(true);return;}
-    const token=sourceToken;
-    audio.play().catch(()=>{if(token!==sourceToken)return;preparing=false;player.playing=false;allowedToPlay=false;playbackError='再生できませんでした。再生を押すか、別の曲を選んでください。';updatePlayback(playbackError);});
-  }
+  if (loadedId !== current().id || !audio.getAttribute('src')) { void startCurrent(true); return; }
+  wantsPlay = true; preparing = true; updatePlayback(); const sourceToken = token;
+  audio.play().catch(() => {
+    if (sourceToken !== token) return;
+    wantsPlay = false; preparing = false; player.playing = false; updatePlayback(); showError('再生できません。「次の曲」を選ぶか、曲一覧を再読み込みしてください。');
+  });
 }
-audio.addEventListener('playing',()=>{if(!allowedToPlay){audio.pause();return;}preparing=false;player.playing=true;playbackError='';updatePlayback();updateSystemMedia();});
-audio.addEventListener('pause',()=>{if(audio.ended||!audio.paused)return;allowedToPlay=false;preparing=false;player.playing=false;updatePlayback();updateSystemMedia();});
-audio.addEventListener('ended',()=>{
-  if(!current())return;player=step(player,1);
-  for(let i=0;i<player.queue.length&&failedTracks.has(current().id);i++)player=step(player,1);
+function move(delta) {
+  if (busy || !ready || !current()) return;
+  player = step(player, delta); void startCurrent(true);
+}
+audio.addEventListener('playing', () => {
+  if (!wantsPlay) { audio.pause(); return; }
+  preparing = false; player.playing = true; updatePlayback(summary());
+});
+audio.addEventListener('pause', () => {
+  if (audio.ended) return;
+  player.playing = false; updatePlayback();
+});
+audio.addEventListener('ended', () => {
+  if (!current() || !wantsPlay) return;
+  player = step(player, 1);
+  for (let i = 0; i < player.queue.length && failed.has(current().id); i++) player = step(player, 1);
   void startCurrent();
 });
-audio.addEventListener('error',()=>{if(audio.error)handleAudioFailure();});
-audio.addEventListener('loadedmetadata',()=>{updateTime();updateSystemMedia();});
-audio.addEventListener('timeupdate',()=>{if(Date.now()-lastTimeUpdate>5000){lastTimeUpdate=Date.now();updateTime();}});
-try{if(navigator.audioSession){navigator.audioSession.type='playback';navigator.audioSession.addEventListener('statechange',()=>{if(navigator.audioSession.state==='interrupted'){allowedToPlay=false;audio.pause();}});}}catch{}
-if('mediaSession' in navigator)for(const [action,handler]of Object.entries({
-  play:()=>{if(!player.playing)togglePlayback();},pause:()=>{allowedToPlay=false;audio.pause();},nexttrack:()=>moveTrack(1),previoustrack:()=>moveTrack(-1),
-  seekto:event=>{if(Number.isFinite(event.seekTime)){audio.currentTime=Math.max(0,Math.min(event.seekTime,audio.duration||0));updateTime();}},
-}))try{navigator.mediaSession.setActionHandler(action,handler);}catch{}
+audio.addEventListener('error', () => { if (audio.error && wantsPlay) handleFailure(); });
+audio.addEventListener('loadedmetadata', updateTime);
+audio.addEventListener('timeupdate', updateTime);
+if (navigator.mediaSession) for (const [action, handler] of Object.entries({
+  play: () => { if (!player.playing) togglePlayback(); },
+  pause: () => { if (player.playing || preparing) togglePlayback(); },
+  nexttrack: () => move(1), previoustrack: () => move(-1),
+  seekto: event => { if (Number.isFinite(event.seekTime) && Number.isFinite(audio.duration)) audio.currentTime = Math.max(0, Math.min(event.seekTime, audio.duration)); },
+})) try { navigator.mediaSession.setActionHandler(action, handler); } catch {}
 
-async function importFiles(files) {
-  if(importing||deleting)return;
-  const selected=[...files].filter(file=>/\.mp3$/i.test(file.name)), compare=new Intl.Collator('ja',{numeric:true}).compare;
-  selected.sort((a,b)=>compare(a.webkitRelativePath||a.name,b.webkitRelativePath||b.name));
-  importing=true;abortImport=new AbortController();importState='running';screen='import';
-  result={total:selected.length,processed:0,newTracks:0,memberships:0,duplicates:0,skipped:0,failures:[],stopped:false,reason:''};render('screen-title');
-  try{wakeLock=await navigator.wakeLock?.request('screen');}catch{}
-  try{await navigator.storage?.persist?.();}catch{}
+async function readRoot(handle, save = false) {
+  busy = true; screen = 'player'; note = '音楽フォルダを確認しています。'; error = ''; render(); announce(note);
   try {
-    for(let index=0;index<selected.length;index++) {
-      if(abortImport.signal.aborted){result.stopped=true;break;}
-      const file=selected[index];document.getElementById('import-progress').textContent=`${selected.length}曲中${index+1}曲目「${file.name}」を確認中。新規保存${result.newTracks}曲。`;
-      try {
-        const info=sourceInfo(file);if(!info){result.processed++;result.skipped++;continue;}
-        await validateMp3(file);const id=await hashBlob(file,abortImport.signal);
-        if(!library.members.some(item=>item.id===id)&&navigator.storage?.estimate){const space=await navigator.storage.estimate();if(space.quota&&space.quota-(space.usage||0)<file.size+1024*1024)throw new DOMException('容量不足','QuotaExceededError');}
-        abortImport.signal.throwIfAborted();const saved=await storeTrack(file,{...info,id});library=saved.library;
-        if(saved.newTrack)result.newTracks++;else if(saved.newMembership)result.memberships++;else result.duplicates++;result.processed++;
-      } catch(error) {
-        if(error.name==='AbortError'){result.stopped=true;break;}
-        if(['QuotaExceededError','NotReadableError','NotFoundError','SecurityError'].includes(error.name)){result.stopped=true;result.reason=readableError(error);break;}
-        result.failures.push({name:file.name,reason:readableError(error)});result.processed++;
-      }
-    }
+    const nextLibrary = await scanDirectory(handle);
+    stop(); root = handle; library = nextLibrary; ready = true; needsPermission = false;
+    if (folder !== null && !library.folders.includes(folder)) folder = null;
+    note = `${entries(library).length}曲、${library.folders.length}フォルダを読み込みました。`;
+    if (!library.members.length) note += ' MP3ファイルが見つかりませんでした。';
+    if (save) try { await saveDirectory(handle); } catch { note += ' フォルダ情報を保存できませんでした。次回は音楽フォルダを登録し直してください。'; }
+  } catch (failure) {
+    stop(); library = { folders: [], members: [] }; ready = false; root = handle; needsPermission = true;
+    error = '音楽フォルダを読み取れません。ドライブの接続を確認し、アクセスを再許可するか、音楽フォルダを再設定してください。'; note = '';
   } finally {
-    if(abortImport.signal.aborted){result.stopped=true;result.reason||='取り込みを中断しました。保存済みの曲は残っています。同じフォルダを選ぶと続きの曲を保存できます。';}
-    importing=false;abortImport=null;importState='result';try{await wakeLock?.release();}catch{}wakeLock=null;
-    folderInput.value='';filesInput.value='';changes?.postMessage('changed');render('import-result');
+    busy = false; render(needsPermission ? 'grant' : 'play'); announce(error || note, !!error);
   }
 }
-function go(next){screen=next;managing=false;render('screen-title');}
-function askDelete(kind,id,triggerId) {
-  if(importing||deleting)return;
-  const item=entries(library,modeFolder()).find(entry=>entry.id===id);
-  pendingDelete={kind,id,folder:modeFolder(),name:item?.name??folder};restoreFocusId=triggerId;
-  document.getElementById('confirm-title').textContent=kind==='folder'?'フォルダ削除の確認':'曲の削除の確認';
-  document.getElementById('confirm-description').textContent=kind==='folder'?`「${folder}」と配下のサブフォルダを端末から削除します。別フォルダにもある曲は、そちらに残ります。`:view==='all'?`「${item.name}」を端末とすべてのフォルダから削除します。`:`「${folder}」から「${item.name}」を外します。別フォルダにもある曲は、そちらに残ります。`;
-  dialog.showModal();requestAnimationFrame(()=>focus('cancel-delete'));
-}
-app.addEventListener('change',event=>{
-  if(event.target.id==='play-order'){allOrder=event.target.value;player=setPlaybackOrder(player,allOrder);updatePlayback(`${orderLabel(allOrder)}を選びました。現在の曲は変わりません。`);}
-});
-app.addEventListener('click',event=>{
-  const target=event.target.closest('button');if(!target)return;
-  if(target.getAttribute('aria-disabled')==='true'){announce(view==='folders'&&!folder?'フォルダを選んでください。':'一覧から曲を選んでください。');return;}
-  if(target.dataset.view){
-    if(view===target.dataset.view)return;
-    view=target.dataset.view;render(target.id);
-    announce(view==='all'?`すべての曲、${entries(library).length}曲。`:'フォルダ別に切り替えました。');return;
+async function register() {
+  if (busy || !supported) return;
+  busy = true;
+  // Call picker directly from the click, before any asynchronous work.
+  try {
+    const handle = await window.showDirectoryPicker({ id: 'mp3-easy-player-pc-music', mode: 'read' });
+    await readRoot(handle, true);
+  } catch (failure) {
+    busy = false;
+    if (failure.name === 'AbortError') { announce('フォルダ選択をキャンセルしました。'); focus('register'); }
+    else { render('register'); showError('フォルダを選べませんでした。WindowsのEdgeまたはChromeで、音楽フォルダを選び直してください。'); }
   }
-  if(target.dataset.folder!==undefined){folder=target.dataset.folder;screen='library';render('play');announce(`「${folder}」を選びました。`);return;}
-  if(target.dataset.track){player=selectTrack(library,modeFolder(),target.dataset.track,allOrder);void startCurrent(true);announce(`「${current().name}」を再生します。`);return;}
-  if(target.dataset.delete){askDelete('track',target.dataset.delete,target.id);return;}
-  switch(target.id) {
-    case 'listen':go('library');break;
-    case 'home':go('home');break;
-    case 'import':case 'again':importState='ready';go('import');break;
-    case 'choose-folder':folderInput.click();break;
-    case 'choose-files':filesInput.click();break;
-    case 'cancel-import':abortImport?.abort();target.setAttribute('aria-disabled','true');announce('中止しています。保存済みの曲は残ります。');break;
-    case 'play':togglePlayback();break;
-    case 'next':moveTrack(1);break;
-    case 'previous':moveTrack(-1);break;
-    case 'choose-library-folder':go('folder-picker');break;
-    case 'cancel-folder':screen='library';render('choose-library-folder');break;
-    case 'manage':managing=true;render('screen-title');break;
-    case 'manage-done':managing=false;render('manage');break;
-    case 'delete-folder':askDelete('folder',null,'delete-folder');break;
-    case 'retry':void initialize();break;
+}
+async function refresh(request = false) {
+  if (busy || !root) return;
+  busy = true;
+  try {
+    const granted = await ensureReadPermission(root, request);
+    if (granted) { busy = false; await readRoot(root); return; }
+    stop(); library = { folders: [], members: [] }; ready = false; needsPermission = true;
+    error = '音楽フォルダへのアクセスが必要です。「アクセスを再許可」を押してください。許可できない場合は音楽フォルダを再設定してください。';
+  } catch { ready = false; needsPermission = true; error = 'アクセスを許可できません。音楽フォルダを再設定してください。'; }
+  busy = false; render('grant'); announce(error, true);
+}
+app.addEventListener('change', event => {
+  if (event.target.id === 'play-order') {
+    order = event.target.value; player = setPlaybackOrder(player, order); updatePlayback(`${orderLabel()}を選びました。`);
   }
 });
-for(const input of [folderInput,filesInput]){
-  input.addEventListener('change',()=>{if(input.files?.length)void importFiles(input.files);});
-  input.addEventListener('cancel',()=>announce('選択をキャンセルしました。保存済みの音楽は変わりません。'));
-}
-document.getElementById('cancel-delete').addEventListener('click',()=>{if(!deleting)dialog.close();});
-dialog.addEventListener('cancel',event=>{if(deleting)event.preventDefault();else pendingDelete=null;});
-dialog.addEventListener('close',()=>{pendingDelete=null;focus(restoreFocusId);});
-document.getElementById('confirm-delete').addEventListener('click',async()=>{
-  if(!pendingDelete||deleting)return;
-  const change=pendingDelete,oldId=current()?.id,wasPlaying=player.playing;deleting=true;
-  for(const id of ['confirm-delete','cancel-delete'])document.getElementById(id).disabled=true;
-  try {
-    library=await deleteFromLibrary(change);player=reconcilePlayer(player,library);const moved=oldId!==current()?.id;
-    if(moved){if(current()){if(wasPlaying)void startCurrent();else{audio.pause();audio.removeAttribute('src');audio.load();preparing=false;}}else stopPlayback();}
-    if(change.kind==='folder'){folder=null;managing=false;}
-    const remaining=entries(library,modeFolder());restoreFocusId=managing?(remaining[0]?`track-${remaining[0].id}`:'manage-done'):'list-title';
-    dialog.close();render(restoreFocusId);changes?.postMessage('changed');updateSystemMedia();
-    announce(`削除しました。${moved?(current()?'次の曲「'+current().name+'」を選びました。':'再生対象がないため停止しました。'):''}`);
-  } catch(error){announce(`削除できませんでした。${readableError(error)}`);}
-  finally{deleting=false;for(const id of ['confirm-delete','cancel-delete'])document.getElementById(id).disabled=false;}
+app.addEventListener('click', event => {
+  const target = event.target.closest('button'); if (!target) return;
+  if (busy || target.getAttribute('aria-disabled') === 'true') { announce(busy ? '処理中です。お待ちください。' : needsPermission ? 'アクセスを再許可してください。' : '音楽フォルダと再生対象を確認してください。'); return; }
+  if (target.dataset.folder !== undefined) {
+    stop(); folder = target.dataset.folder; view = 'folders'; screen = 'player'; render('play');
+    announce(`${folderLabel(folder)}、${items().length}曲を選びました。再生ボタンで開始します。`); return;
+  }
+  if (target.dataset.track !== undefined) { player = selectTrack(library, scope(), target.dataset.track, order); void startCurrent(true); return; }
+  switch (target.id) {
+    case 'register': void register(); break;
+    case 'grant': void refresh(true); break;
+    case 'refresh': void refresh(); break;
+    case 'choose-folder': screen = 'folders'; render('screen-title'); break;
+    case 'back': screen = 'player'; render('choose-folder'); break;
+    case 'view-all': case 'view-folders': {
+      const next = target.id === 'view-all' ? 'all' : 'folders';
+      if (view === next) break;
+      stop(); view = next; render(target.id); announce(`${view === 'all' ? 'すべての曲' : 'フォルダ別'}を選びました。再生ボタンで開始します。`); break;
+    }
+    case 'play': togglePlayback(); break;
+    case 'previous': move(-1); break;
+    case 'next': move(1); break;
+  }
 });
-document.addEventListener('visibilitychange',()=>{if(document.hidden&&importing){result.reason='画面を離れたため中断しました。保存済みの曲は残っています。';abortImport?.abort();}});
-async function refreshLibrary() {
-  if(importing||deleting||dialog.open)return;
-  try {
-    const next=await readLibrary();if(next.revision===library.revision)return;
-    const old=current()?.id;library=next;player=reconcilePlayer(player,library);
-    if(old&&!current())stopPlayback('別の画面で曲が削除されたため停止しました。');else if(old!==current()?.id&&player.playing)void startCurrent();
-    if(folder&&!library.folders.includes(folder)){folder=null;managing=false;}
-    render('screen-title');announce('保存した曲の一覧を更新しました。');
-  }catch{}
-}
-if(changes)changes.onmessage=()=>void refreshLibrary();
-window.addEventListener('focus',()=>void refreshLibrary());
-document.getElementById('reload-app').addEventListener('click',()=>{if(importing){announce('取り込みが終わってから読み込み直してください。');return;}audio.pause();location.reload();});
-async function setupOffline() {
-  const element=document.getElementById('offline-state');
-  if(!('serviceWorker' in navigator)){element.textContent='オフライン起動の準備ができません。Safariで開いてください。';return;}
-  try {
-    const url=new URL('sw.js?v='+VERSION,base);
-    const registration=await navigator.serviceWorker.register(url,{type:'module',scope:base.pathname,updateViaCache:'none'});
-    // An older active worker does not prove the current release was cached.
-    const worker=registration.installing||registration.waiting||registration.active;
-    if(!worker||worker.scriptURL!==url.href)throw new Error('更新の準備待ち');
-    await new Promise((resolve,reject)=>{
-      const finish=error=>{clearTimeout(timer);worker.removeEventListener('statechange',check);error?reject(error):resolve();};
-      const check=()=>{if(worker.state==='activated')finish();else if(worker.state==='redundant')finish(new Error('資材を保存できません'));};
-      const timer=setTimeout(()=>finish(new Error('準備が終わりません')),30000);
-      worker.addEventListener('statechange',check);check();
-    });
-    element.textContent='オフライン利用の準備ができました。保存した曲は通信なしで再生できます。';
-  }catch{element.textContent='オフラインの準備が完了していません。通信できる状態で画面を読み込み直してください。保存済みの曲は残っています。';}
-}
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && screen === 'folders') { screen = 'player'; render('choose-folder'); }
+});
+document.querySelector('#reload-app').addEventListener('click', () => location.reload());
 async function initialize() {
-  app.setAttribute('aria-busy','true');
-  try{library=await readLibrary();fatal='';render('screen-title');}catch(error){fatal=readableError(error);render('screen-title');}
-  finally{app.removeAttribute('aria-busy');}
+  busy = true; render();
+  if (!supported) { busy = false; render(); return; }
+  try { root = await loadDirectory(); }
+  catch { note = 'フォルダ情報を復元できませんでした。音楽フォルダを登録してください。'; }
+  busy = false;
+  if (root) await refresh(); else { render(); if (note) announce(note); }
 }
-void initialize();void setupOffline();
+void initialize();
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').then(async registration => {
+  await navigator.serviceWorker.ready;
+  document.querySelector('#offline-state').textContent = '画面をオフラインで起動する準備ができました。音楽の再生には元ファイルと読み取り許可が必要です。';
+  registration.addEventListener('updatefound', () => {
+    const worker = registration.installing;
+    worker?.addEventListener('statechange', () => {
+      if (worker.state === 'installed' && navigator.serviceWorker.controller) {
+        document.querySelector('#offline-state').textContent = '更新があります。再生を終えてから「画面を読み込み直す」を押してください。';
+      }
+    });
+  });
+}).catch(() => { document.querySelector('#offline-state').textContent = 'オフライン起動の準備ができません。通信できる状態で利用してください。'; });
